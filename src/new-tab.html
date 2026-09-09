@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tab Workspace</title>
+    <link rel="stylesheet" href="new-tab.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Tab Workspace</p>
+          <h1>你要找什么？</h1>
+          <p id="summary" class="summary">同步中...</p>
+          <p id="status" class="status" aria-live="polite"></p>
+        </div>
+        <div class="hero-actions">
+          <button id="exportLogsButton" class="secondary-button" type="button">
+            导出日志
+          </button>
+          <button id="syncButton" class="sync-button" type="button">
+            同步
+          </button>
+        </div>
+      </header>
+
+      <section class="search-box">
+        <input
+          id="searchInput"
+          type="search"
+          autocomplete="off"
+          placeholder="搜索 Workspace / Group / Tab / URL / 域名"
+        />
+      </section>
+
+      <section id="recentSection" class="section hidden">
+        <div class="section-title">
+          <h2>最近使用</h2>
+          <span id="recentMeta"></span>
+        </div>
+        <div id="recentList" class="recent-list"></div>
+      </section>
+
+      <section id="resultsSection" class="section hidden">
+        <div class="section-title">
+          <h2>搜索结果</h2>
+          <span id="resultsMeta"></span>
+        </div>
+        <div id="resultsList" class="results-list"></div>
+      </section>
+
+      <section id="windowSection" class="section">
+        <div class="section-title">
+          <h2>窗口</h2>
+          <span id="windowMeta"></span>
+        </div>
+        <div id="windowGrid" class="window-grid"></div>
+      </section>
+
+      <section id="currentSection" class="section">
+        <div class="section-title">
+          <h2>当前分组</h2>
+          <span id="currentMeta"></span>
+        </div>
+        <div id="currentGrid" class="group-grid"></div>
+      </section>
+
+      <section id="snapshotSection" class="section">
+        <div class="section-title">
+          <h2>同步快照</h2>
+          <span id="snapshotMeta"></span>
+        </div>
+        <div id="snapshotGrid" class="workspace-grid"></div>
+      </section>
+    </main>
+
+    <script type="module" src="new-tab.js"></script>
+  </body>
+</html>

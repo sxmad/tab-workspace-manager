@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tab Workspace Manager</title>
+    <link rel="stylesheet" href="side-panel.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div>
+        <h1>Tab Workspace</h1>
+        <p id="syncSummary">同步中...</p>
+        <p id="status" class="status" aria-live="polite"></p>
+      </div>
+      <div class="header-actions">
+        <button id="exportLogsButton" class="secondary-button" type="button">
+          日志
+        </button>
+        <button id="resyncButton" type="button">同步</button>
+      </div>
+    </header>
+
+    <section class="search">
+      <input
+        id="searchInput"
+        type="search"
+        autocomplete="off"
+        placeholder="搜索窗口、分组、标签或网址"
+      />
+    </section>
+
+    <main id="app" class="app"></main>
+
+    <script type="module" src="side-panel.js"></script>
+  </body>
+</html>

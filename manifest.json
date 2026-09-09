@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Workspace Manager",
+  "description": "Group-first Chrome tab workspace manager.",
+  "version": "0.1.38",
+  "minimum_chrome_version": "116",
+  "permissions": ["tabs", "tabGroups", "windows", "storage", "sidePanel"],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "src/side-panel.html"
+  },
+  "chrome_url_overrides": {
+    "newtab": "src/new-tab.html"
+  },
+  "action": {
+    "default_title": "Tab Workspace Manager"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+E",
+        "mac": "Command+Shift+E"
+      },
+      "description": "打开 Tab Workspace Manager 侧边栏"
+    }
+  }
+}
