@@ -10,6 +10,11 @@ const MAX_RECENT_GROUPS = 8;
 const MAX_RECENT_ITEMS = 20;
 const MAX_SAVED_WORKSPACES = 24;
 const MAX_DIAGNOSTIC_LOGS = 200;
+const MAX_ICON_URL_LENGTH = 2048;
+const MAX_PENDING_ACTIVITY_WRITES = 100;
+const MAX_PENDING_DIAGNOSTIC_WRITES = 100;
+const MAX_DIAGNOSTIC_DETAIL_LENGTH = 4096;
+const MAX_WINDOW_ALIAS_LENGTH = 200;
 const UNGROUPED_GROUP_ID = chrome.tabGroups.TAB_GROUP_ID_NONE;
 
 let syncTimer = null;
@@ -18,9 +23,13 @@ let syncRequested = false;
 let lastRuntimeState = null;
 let lastActiveByGroup = new Map();
 let diagnosticLogWriteChain = Promise.resolve();
+let diagnosticLogQueueDepth = 0;
 let recentActivityWriteChain = Promise.resolve();
-let tabActivationChain = Promise.resolve();
+let recentActivityQueueDepth = 0;
+const pendingTabActivations = new Map();
+let tabActivationDrain = null;
 let restoreInFlight = false;
+let restoreCompletion = null;
 
 chrome.runtime.onInstalled.addListener(() => {
   runSafely(async () => {
@@ -77,16 +86,7 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
   }
 });
 chrome.tabs.onActivated.addListener(({ tabId }) => {
-  const processActivation = () =>
-    runSafely(async () => {
-      const tab = await chrome.tabs.get(tabId);
-      await recordTabActivity(tab);
-      scheduleSync();
-    }, "tabs.onActivated");
-  tabActivationChain = tabActivationChain.then(
-    processActivation,
-    processActivation,
-  );
+  queueTabActivation(tabId);
 });
 
 chrome.windows.onCreated.addListener(scheduleSync);
@@ -132,6 +132,7 @@ async function handleMessage(message) {
         message.workspaceId,
         message.groupIndex,
         message.target || "new",
+        message.sourceGroupId,
       );
     case "RESTORE_SAVED_UNGROUPED":
       return restoreSavedUngrouped(
@@ -175,14 +176,49 @@ function scheduleSync() {
   }, 150);
 }
 
+function queueTabActivation(tabId) {
+  if (!Number.isInteger(tabId)) return;
+  pendingTabActivations.set(tabId, tabId);
+  while (pendingTabActivations.size > MAX_PENDING_ACTIVITY_WRITES) {
+    pendingTabActivations.delete(pendingTabActivations.keys().next().value);
+  }
+  if (tabActivationDrain) return;
+  startTabActivationDrain();
+}
+
+function startTabActivationDrain() {
+  if (tabActivationDrain) return;
+  tabActivationDrain = drainTabActivations().finally(() => {
+    tabActivationDrain = null;
+    if (pendingTabActivations.size) startTabActivationDrain();
+  });
+}
+
+async function drainTabActivations() {
+  while (pendingTabActivations.size) {
+    const tabIds = [...pendingTabActivations.values()];
+    pendingTabActivations.clear();
+    for (const tabId of tabIds) {
+      await runSafely(async () => {
+        const tab = await chrome.tabs.get(tabId);
+        await recordTabActivity(tab);
+        scheduleSync();
+      }, "tabs.onActivated");
+    }
+  }
+}
+
 async function getRuntimeState() {
   if (lastRuntimeState) {
     if (Array.isArray(lastRuntimeState.recentTabs)) return lastRuntimeState;
     return syncRuntimeState();
   }
-  const stored = await chrome.storage.local.get([RUNTIME_STATE_KEY]);
+  const stored = await chrome.storage.local.get([
+    RUNTIME_STATE_KEY,
+    SAVED_WORKSPACES_KEY,
+  ]);
   if (stored[RUNTIME_STATE_KEY]?.summary) {
-    lastRuntimeState = stored[RUNTIME_STATE_KEY];
+    lastRuntimeState = hydrateRuntimeState(stored);
     if (Array.isArray(lastRuntimeState.recentTabs)) return lastRuntimeState;
     return syncRuntimeState();
   }
@@ -190,10 +226,15 @@ async function getRuntimeState() {
 }
 
 async function syncAndSaveRuntimeState() {
+  if (restoreInFlight && restoreCompletion) await restoreCompletion;
   return syncRuntimeState();
 }
 
-async function syncRuntimeState() {
+async function syncRuntimeState(options = {}) {
+  if (restoreInFlight && !options.allowDuringRestore && restoreCompletion) {
+    await restoreCompletion;
+    return syncRuntimeState(options);
+  }
   if (syncInFlight) {
     syncRequested = true;
     return syncInFlight;
@@ -231,7 +272,17 @@ async function performSyncRuntimeState() {
   ]);
   const recentRecords = asArray(stored[RECENT_GROUPS_KEY]);
   const recentItemRecords = asArray(stored[RECENT_ITEMS_KEY]);
-  const windowAliases = asObject(stored[WINDOW_ALIASES_KEY]);
+  const storedWindowAliases = asObject(stored[WINDOW_ALIASES_KEY]);
+  const activeWindowIds = new Set(windows.map((window) => String(window.id)));
+  const windowAliases = Object.fromEntries(
+    Object.entries(storedWindowAliases)
+      .filter(([windowId]) => activeWindowIds.has(windowId))
+      .map(([windowId, alias]) => [
+        windowId,
+        String(alias || "").trim().slice(0, MAX_WINDOW_ALIAS_LENGTH),
+      ])
+      .filter(([, alias]) => alias),
+  );
   const existingSavedWorkspaces = asArray(stored[SAVED_WORKSPACES_KEY]);
   const groupById = new Map(groups.map((group) => [group.id, group]));
   const runtimeWindows = orderRuntimeWindows(
@@ -240,6 +291,8 @@ async function performSyncRuntimeState() {
     ),
     stored[WINDOW_ORDER_KEY],
   );
+  const cleanedWindowOrder = runtimeWindows.map((window) => window.id);
+  pruneLastActiveGroups(runtimeWindows);
   const cleanedRecentItemRecords = pruneRecentItemRecords(
     runtimeWindows,
     recentItemRecords,
@@ -277,14 +330,66 @@ async function performSyncRuntimeState() {
     summary,
   };
 
-  lastRuntimeState = runtimeState;
-  await chrome.storage.local.set({
-    [RUNTIME_STATE_KEY]: runtimeState,
+  const persistedRuntimeState = { ...runtimeState };
+  delete persistedRuntimeState.savedWorkspaces;
+  const persistedValues = {
+    [RUNTIME_STATE_KEY]: persistedRuntimeState,
     [SYNC_SUMMARY_KEY]: summary,
     [SAVED_WORKSPACES_KEY]: savedWorkspaces,
-  });
+  };
+  if (!sameArray(cleanedWindowOrder, stored[WINDOW_ORDER_KEY])) {
+    persistedValues[WINDOW_ORDER_KEY] = cleanedWindowOrder;
+  }
+  if (!sameObject(windowAliases, storedWindowAliases)) {
+    persistedValues[WINDOW_ALIASES_KEY] = windowAliases;
+  }
+  await chrome.storage.local.set(persistedValues);
+  lastRuntimeState = runtimeState;
   notifyRuntimeStateChanged(runtimeState);
   return runtimeState;
+}
+
+function hydrateRuntimeState(stored) {
+  const runtimeState = stored?.[RUNTIME_STATE_KEY];
+  if (!runtimeState || typeof runtimeState !== "object") return null;
+  const storedWorkspaces = stored?.[SAVED_WORKSPACES_KEY];
+  return {
+    ...runtimeState,
+    savedWorkspaces: Array.isArray(storedWorkspaces)
+      ? storedWorkspaces
+      : asArray(runtimeState.savedWorkspaces),
+  };
+}
+
+function pruneLastActiveGroups(windows) {
+  const activeKeys = new Set(
+    (windows || []).flatMap((windowState) =>
+      (windowState.groups || []).map((group) =>
+        groupRuntimeKey(windowState.id, group.id),
+      ),
+    ),
+  );
+  for (const key of lastActiveByGroup.keys()) {
+    if (!activeKeys.has(key)) lastActiveByGroup.delete(key);
+  }
+}
+
+function sameArray(left, right) {
+  return (
+    Array.isArray(right) &&
+    left.length === right.length &&
+    left.every((value, index) => Number(value) === Number(right[index]))
+  );
+}
+
+function sameObject(left, right) {
+  const rightObject = asObject(right);
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(rightObject);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) => String(left[key]) === String(rightObject[key]))
+  );
 }
 
 function orderRuntimeWindows(windows, savedOrder) {
@@ -349,6 +454,7 @@ function buildRuntimeWindow(window, groupById, alias) {
 function buildRuntimeGroup(groupId, windowId, windowAlias, tabs, chromeGroup) {
   const activeTab = tabs.find((tab) => tab.active);
   const lastActive = lastActiveByGroup.get(groupRuntimeKey(windowId, groupId));
+  const lastActiveTab = tabs.find((tab) => tab.id === lastActive?.tabId);
 
   return {
     id: groupId,
@@ -363,7 +469,7 @@ function buildRuntimeGroup(groupId, windowId, windowAlias, tabs, chromeGroup) {
     active: Boolean(activeTab),
     pinned: false,
     lastActiveAt: lastActive?.timestamp,
-    lastActiveTabId: lastActive?.tabId || activeTab?.id || tabs[0]?.id,
+    lastActiveTabId: lastActiveTab?.id || activeTab?.id || tabs[0]?.id,
     tabs: tabs.sort((a, b) => a.index - b.index),
   };
 }
@@ -402,7 +508,10 @@ function buildRecentGroups(windows, recentRecords) {
         groupRuntimeKey(record.windowId, record.groupId),
       );
       if (!group) return null;
-      const lastActiveTabId = record.tabId || group.lastActiveTabId;
+      const lastActiveTabId =
+        group.tabs.find((tab) => tab.id === record.tabId)?.id ||
+        group.lastActiveTabId ||
+        group.tabs[0]?.id;
       const lastActiveTab =
         group.tabs.find((tab) => tab.id === lastActiveTabId) || group.tabs[0];
       return {
@@ -609,6 +718,9 @@ async function recordActiveGroupedTabs(windows) {
 }
 
 function recordTabActivity(tab, options = {}) {
+  if (recentActivityQueueDepth >= MAX_PENDING_ACTIVITY_WRITES) {
+    return Promise.resolve();
+  }
   const write = async () => {
     if (isWorkspaceNewTab(tab)) return;
     if (tab.groupId !== UNGROUPED_GROUP_ID) {
@@ -616,8 +728,16 @@ function recordTabActivity(tab, options = {}) {
     }
     await recordRecentItem(tab, options);
   };
+  recentActivityQueueDepth += 1;
   const result = recentActivityWriteChain.then(write, write);
-  recentActivityWriteChain = result.catch(() => {});
+  recentActivityWriteChain = result
+    .catch(() => {})
+    .finally(() => {
+      recentActivityQueueDepth = Math.max(0, recentActivityQueueDepth - 1);
+      if (recentActivityQueueDepth === 0) {
+        recentActivityWriteChain = Promise.resolve();
+      }
+    });
   return result;
 }
 
@@ -697,14 +817,30 @@ async function activateTab(tabId, windowId) {
 }
 
 async function activateGroup(groupId, windowId) {
-  const state = await getRuntimeState();
-  const targetWindow = state.windows.find((window) => window.id === windowId);
-  const targetGroup = targetWindow?.groups.find(
+  let state = await getRuntimeState();
+  let targetWindow = state.windows.find((window) => window.id === windowId);
+  let targetGroup = targetWindow?.groups.find(
     (group) => group.id === groupId,
   );
+  if (!targetGroup) {
+    state = await syncRuntimeState();
+    targetWindow = state.windows.find((window) => window.id === windowId);
+    targetGroup = targetWindow?.groups.find((group) => group.id === groupId);
+  }
   if (!targetGroup) throw new Error("Group not found");
 
-  const targetTabId = targetGroup.lastActiveTabId || targetGroup.tabs[0]?.id;
+  const liveTabs = await chrome.tabs.query({ windowId, groupId });
+  if (!liveTabs.length) {
+    await syncRuntimeState();
+    throw new Error("Group has no tabs");
+  }
+
+  const liveTabIds = new Set(liveTabs.map((tab) => tab.id));
+  const targetTabId = [
+    targetGroup.lastActiveTabId,
+    liveTabs.find((tab) => tab.active)?.id,
+    liveTabs[0]?.id,
+  ].find((tabId) => liveTabIds.has(tabId));
   if (!targetTabId) throw new Error("Group has no tabs");
 
   await chrome.windows.update(windowId, { focused: true });
@@ -753,7 +889,9 @@ async function openSidePanel(windowId) {
 async function setWindowAlias(windowId, alias) {
   const stored = await chrome.storage.local.get([WINDOW_ALIASES_KEY]);
   const aliases = asObject(stored[WINDOW_ALIASES_KEY]);
-  const normalizedAlias = String(alias || "").trim();
+  const normalizedAlias = String(alias || "")
+    .trim()
+    .slice(0, MAX_WINDOW_ALIAS_LENGTH);
   if (normalizedAlias) {
     aliases[String(windowId)] = normalizedAlias;
   } else {
@@ -794,6 +932,7 @@ async function saveGroupWorkspace(windowId, groupId) {
     workspaceIdFromWindow(targetWindow),
     targetWindow.groups.indexOf(targetGroup),
     "new",
+    targetGroup.id,
   );
 }
 
@@ -825,9 +964,20 @@ async function restoreSavedWorkspace(workspaceId, target = "new") {
   return restoreSavedItems(allTabs, target);
 }
 
-async function restoreSavedGroup(workspaceId, groupIndex, target = "new") {
+async function restoreSavedGroup(
+  workspaceId,
+  groupIndex,
+  target = "new",
+  sourceGroupId,
+) {
   const workspace = await getSavedWorkspace(workspaceId);
-  const group = (workspace.groups || [])[Number(groupIndex)];
+  const group =
+    sourceGroupId !== undefined && sourceGroupId !== null
+      ? (workspace.groups || []).find(
+          (candidate) =>
+            String(candidate.sourceGroupId) === String(sourceGroupId),
+        )
+      : (workspace.groups || [])[Number(groupIndex)];
   if (!group) throw new Error("Group not found");
 
   const groupTabs = asArray(group.tabs)
@@ -873,10 +1023,15 @@ async function restoreSavedItems(items, target = "new") {
   clearTimeout(syncTimer);
   syncTimer = null;
   restoreInFlight = true;
+  let resolveRestoreCompletion;
+  restoreCompletion = new Promise((resolve) => {
+    resolveRestoreCompletion = resolve;
+  });
   let createdWindowId = null;
   const createdTabIds = [];
 
   try {
+    if (syncInFlight) await syncInFlight;
     return await restoreSavedItemsTransaction(
       items,
       target,
@@ -895,8 +1050,10 @@ async function restoreSavedItems(items, target = "new") {
     }
     throw error;
   } finally {
+    await syncRuntimeState({ allowDuringRestore: true }).catch(() => {});
     restoreInFlight = false;
-    await syncRuntimeState().catch(() => {});
+    resolveRestoreCompletion?.();
+    restoreCompletion = null;
   }
 }
 
@@ -1045,10 +1202,29 @@ function buildSyncedWorkspaces(windows, existingWorkspaces = []) {
     }
   }
 
-  return [...mergedWorkspaces, ...recoveriesByWindowId.values()].slice(
-    0,
-    MAX_SAVED_WORKSPACES,
+  const recoveryWorkspaces = [...recoveriesByWindowId.values()]
+    .map(sanitizeWorkspaceSnapshot)
+    .filter(snapshotHasTabs)
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const currentWorkspaces = mergedWorkspaces.filter((workspace) =>
+    currentIds.has(workspace.id),
   );
+  const historicalWorkspaces = mergedWorkspaces.filter(
+    (workspace) => !currentIds.has(workspace.id),
+  );
+  const candidates = [
+    ...currentWorkspaces,
+    ...recoveryWorkspaces,
+    ...historicalWorkspaces,
+  ];
+  const seen = new Set();
+  return candidates
+    .filter((workspace) => {
+      if (!workspace?.id || seen.has(workspace.id)) return false;
+      seen.add(workspace.id);
+      return snapshotHasTabs(workspace);
+    })
+    .slice(0, MAX_SAVED_WORKSPACES);
 }
 
 function buildClosedGroupRecovery(workspace, currentTabIds) {
@@ -1073,7 +1249,7 @@ function createRecoveryWorkspace(existing, windowState, groups, now) {
     recoveryFor: windowState.id,
     name: `${existing?.name || windowState.displayName || `窗口 ${windowState.id}`} · 关闭前`,
     createdAt: existing?.createdAt || now,
-    updatedAt: existing?.updatedAt || now,
+    updatedAt: now,
     sourceWindowId: windowState.id,
     groups,
     ungroupedTabs: [],
@@ -1094,6 +1270,7 @@ function appendRecoveryGroups(recovery, groups) {
   });
   return {
     ...recovery,
+    updatedAt: Date.now(),
     groups: [...asArray(recovery.groups), ...appended].sort(
       (a, b) => (a.index ?? 0) - (b.index ?? 0),
     ),
@@ -1114,12 +1291,21 @@ function sanitizeWorkspaceSnapshot(workspace) {
       .filter((group) => group && typeof group === "object")
       .map((group) => ({
         ...group,
-        tabs: asArray(group.tabs).filter((tab) => !isWorkspaceNewTab(tab)),
+        tabs: asArray(group.tabs)
+          .filter((tab) => !isWorkspaceNewTab(tab))
+          .map(sanitizeSavedTab),
       }))
       .filter((group) => group.tabs.length),
-    ungroupedTabs: asArray(workspace.ungroupedTabs).filter(
-      (tab) => !isWorkspaceNewTab(tab),
-    ),
+    ungroupedTabs: asArray(workspace.ungroupedTabs)
+      .filter((tab) => !isWorkspaceNewTab(tab))
+      .map(sanitizeSavedTab),
+  };
+}
+
+function sanitizeSavedTab(tab) {
+  return {
+    ...tab,
+    favIconUrl: safeIconUrl(tab?.favIconUrl),
   };
 }
 
@@ -1239,6 +1425,7 @@ function isWorkspaceNewTab(tab) {
 function safeIconUrl(url) {
   const value = String(url || "").trim();
   if (!value) return "";
+  if (value.length > MAX_ICON_URL_LENGTH) return "";
   if (
     value.startsWith("http://") ||
     value.startsWith("https://") ||
@@ -1283,6 +1470,7 @@ async function getDiagnosticLogs() {
 }
 
 async function writeDiagnosticLog(level, context, error, details) {
+  if (diagnosticLogQueueDepth >= MAX_PENDING_DIAGNOSTIC_WRITES) return;
   const entry = {
     timestamp: Date.now(),
     level,
@@ -1293,20 +1481,32 @@ async function writeDiagnosticLog(level, context, error, details) {
         : String(error?.message || error || "Unknown error"),
     stack:
       error instanceof Error ? error.stack || "" : String(error?.stack || ""),
-    details: details || null,
+    details: sanitizeDiagnosticDetails(details),
     extensionVersion: chrome.runtime.getManifest().version,
   };
 
+  diagnosticLogQueueDepth += 1;
   diagnosticLogWriteChain = diagnosticLogWriteChain
     .catch(() => {})
     .then(async () => {
       const stored = await chrome.storage.local.get([DIAGNOSTIC_LOGS_KEY]);
       const logs = Array.isArray(stored[DIAGNOSTIC_LOGS_KEY])
         ? stored[DIAGNOSTIC_LOGS_KEY]
+            .filter((log) => log && typeof log === "object")
+            .map((log) => ({
+              ...log,
+              details: sanitizeDiagnosticDetails(log.details),
+            }))
         : [];
       await chrome.storage.local.set({
         [DIAGNOSTIC_LOGS_KEY]: [entry, ...logs].slice(0, MAX_DIAGNOSTIC_LOGS),
       });
+    })
+    .finally(() => {
+      diagnosticLogQueueDepth = Math.max(0, diagnosticLogQueueDepth - 1);
+      if (diagnosticLogQueueDepth === 0) {
+        diagnosticLogWriteChain = Promise.resolve();
+      }
     });
 
   try {
@@ -1316,5 +1516,18 @@ async function writeDiagnosticLog(level, context, error, details) {
       "Tab Workspace Manager: failed to persist diagnostic log",
       loggingError,
     );
+  }
+}
+
+function sanitizeDiagnosticDetails(details) {
+  if (!details) return null;
+  try {
+    const serialized = JSON.stringify(details);
+    if (!serialized) return null;
+    return serialized.length > MAX_DIAGNOSTIC_DETAIL_LENGTH
+      ? `${serialized.slice(0, MAX_DIAGNOSTIC_DETAIL_LENGTH)}…`
+      : JSON.parse(serialized);
+  } catch {
+    return String(details).slice(0, MAX_DIAGNOSTIC_DETAIL_LENGTH);
   }
 }

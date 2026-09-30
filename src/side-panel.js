@@ -15,9 +15,11 @@ const COLORS = {
   cyan: "#198f9c",
   orange: "#c96b19",
 };
+const MAX_ICON_URL_LENGTH = 2048;
 let state = normalize({});
 let query = "";
 let selectedIndex = 0;
+const expandedGroups = new Set();
 installErrorLogging("side-panel");
 init().catch((e) => logError("side-panel.init", e));
 async function init() {
@@ -27,6 +29,7 @@ async function init() {
     render();
   });
   searchInput.addEventListener("keydown", (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter") {
       e.preventDefault();
       if (e.key === "ArrowDown") moveSelection(1);
@@ -80,21 +83,141 @@ async function resync() {
 }
 function render() {
   const s = state.summary || {};
+  pruneExpandedGroups(state.windows);
   summary.textContent = `${s.windowCount || 0} 窗口 · ${s.groupCount || 0} 分组 · ${s.tabCount || 0} 标签`;
   app.replaceChildren();
-  const rows = query ? search(query) : recentRows();
-  if (!query && rows.length) {
-    const heading = document.createElement("div");
-    heading.className = "section-label";
-    heading.textContent = "最近使用";
-    app.append(heading);
+  if (query) {
+    const rows = search(query);
+    app.append(...(rows.length ? rows : [empty("没有匹配内容")]));
+  } else {
+    const rows = dashboardRows();
+    app.append(...(rows.length ? rows : [empty("暂无打开的标签")]));
   }
-  app.append(
-    ...(rows.length
-      ? rows
-      : [empty(query ? "没有匹配内容" : "暂无最近记录，直接搜索即可")]),
-  );
   updateSelection();
+}
+
+function dashboardRows() {
+  const rows = [];
+  pruneExpandedGroups(state.windows);
+  const recent = recentRows();
+  if (recent.length) {
+    rows.push(label("最近使用"), ...recent);
+  }
+
+  const windows = (state.windows || []).filter((windowState) => count(windowState));
+  if (windows.length) {
+    rows.push(label("当前窗口"));
+    for (const windowState of windows) {
+      const name = windowState.displayName || `窗口 ${windowState.id}`;
+      rows.push(
+        section(name, `${count(windowState)} 标签`, () => focusWindow(windowState.id)),
+      );
+      for (const group of windowState.groups || []) {
+        rows.push(groupEntry(group, windowState, name));
+      }
+      if (windowState.ungroupedTabs?.length) {
+        rows.push(
+          section(
+            "未分组",
+            `${windowState.ungroupedTabs.length} 标签 · ${name}`,
+            () => activateTab(windowState.ungroupedTabs[0].id, windowState.id),
+            "grey",
+          ),
+        );
+      }
+    }
+  }
+
+  const workspaces = state.savedWorkspaces || [];
+  if (workspaces.length) {
+    rows.push(label("同步快照"));
+    for (const workspace of workspaces) {
+      rows.push(
+        section(
+          workspace.name,
+          `${count(workspace)} 标签 · 快照`,
+          () => restore(workspace),
+        ),
+      );
+      for (const group of workspace.groups || []) {
+        rows.push(
+          section(
+            group.title || "未命名分组",
+            `${workspace.name} · ${group.tabs?.length || 0} 标签`,
+            () => restoreGroup(workspace, group),
+            group.color,
+          ),
+        );
+      }
+      if (workspace.ungroupedTabs?.length) {
+        rows.push(
+          section(
+            "未分组标签",
+            `${workspace.name} · ${workspace.ungroupedTabs.length} 标签`,
+            () => restoreUngrouped(workspace),
+            "grey",
+          ),
+        );
+      }
+    }
+  }
+  return rows;
+}
+
+function pruneExpandedGroups(windows) {
+  const keys = new Set(
+    (windows || []).flatMap((windowState) =>
+      (windowState.groups || []).map(
+        (group) => `${windowState.id}:${group.id}`,
+      ),
+    ),
+  );
+  for (const key of expandedGroups) {
+    if (!keys.has(key)) expandedGroups.delete(key);
+  }
+}
+
+function label(text) {
+  const heading = document.createElement("div");
+  heading.className = "section-label";
+  heading.textContent = text;
+  return heading;
+}
+
+function groupEntry(group, windowState, windowName) {
+  const key = `${windowState.id}:${group.id}`;
+  const expanded = expandedGroups.has(key);
+  const wrapper = document.createElement("div");
+  wrapper.className = "group-entry";
+  const open = section(
+    group.title || "未命名分组",
+    `${windowName} · ${group.tabs?.length || 0} 标签`,
+    () => activateGroup(group.id, windowState.id),
+    group.color,
+  );
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "group-toggle";
+  toggle.textContent = expanded ? "收起" : "展开";
+  toggle.setAttribute("aria-expanded", String(expanded));
+  toggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (expanded) expandedGroups.delete(key);
+    else expandedGroups.add(key);
+    render();
+  });
+  wrapper.append(open, toggle);
+  if (expanded) {
+    for (const tab of group.tabs || []) {
+      const tabNode = tabRow(
+        tab,
+        `${windowName} / ${group.title || "分组"}`,
+      );
+      tabNode.classList.add("group-tab-row");
+      wrapper.append(tabNode);
+    }
+  }
+  return wrapper;
 }
 function recentRows() {
   const items = state.recentItems?.length
@@ -118,63 +241,66 @@ function recentRows() {
 }
 function search(q) {
   const rows = [];
+  const addSection = (title, meta, onClick, color) =>
+    rows.push({ kind: "section", title, meta, onClick, color });
+  const addTab = (tab, prefix, snapshot = false) =>
+    rows.push({ kind: "tab", tab, prefix, snapshot });
   for (const w of state.windows) {
     const name = w.displayName || `窗口 ${w.id}`;
     if (match(name, q))
-      rows.push(section(name, `${count(w)} 标签`, () => focusWindow(w.id)));
+      addSection(name, `${count(w)} 标签`, () => focusWindow(w.id));
     for (const g of w.groups || []) {
       if (match(`${g.title} ${name}`, q))
-        rows.push(
-          section(
-            g.title || "未命名分组",
-            `${name} · ${g.tabs?.length || 0} 标签`,
-            () => activateGroup(g.id, w.id),
-            g.color,
-          ),
+        addSection(
+          g.title || "未命名分组",
+          `${name} · ${g.tabs?.length || 0} 标签`,
+          () => activateGroup(g.id, w.id),
+          g.color,
         );
       for (const t of g.tabs || [])
         if (
           !isWorkspaceNewTab(t) &&
           match(`${t.title} ${t.url} ${t.domain}`, q)
         )
-          rows.push(tabRow(t, `${name} / ${g.title || "分组"}`));
+          addTab(t, `${name} / ${g.title || "分组"}`);
     }
     for (const t of w.ungroupedTabs || [])
       if (!isWorkspaceNewTab(t) && match(`${t.title} ${t.url} ${t.domain}`, q))
-        rows.push(tabRow(t, `${name} / 未分组`));
+        addTab(t, `${name} / 未分组`);
   }
   for (const ws of state.savedWorkspaces) {
     if (match(ws.name, q))
-      rows.push(
-        section(ws.name, `${count(ws)} 标签 · 快照`, () => restore(ws)),
-      );
+      addSection(ws.name, `${count(ws)} 标签 · 快照`, () => restore(ws));
     for (const g of ws.groups || []) {
       if (match(`${g.title} ${ws.name}`, q))
-        rows.push(
-          section(
-            g.title || "未命名分组",
-            `${ws.name} · ${g.tabs?.length || 0} 标签 · 快照`,
-            () => restoreGroup(ws, g),
-            g.color,
-          ),
+        addSection(
+          g.title || "未命名分组",
+          `${ws.name} · ${g.tabs?.length || 0} 标签 · 快照`,
+          () => restoreGroup(ws, g),
+          g.color,
         );
       for (const t of g.tabs || [])
         if (!isWorkspaceNewTab(t) && match(`${t.title} ${t.url}`, q))
-          rows.push(tabRow(t, `${ws.name} / ${g.title || "分组"}`, true));
+          addTab(t, `${ws.name} / ${g.title || "分组"}`, true);
     }
     for (const t of ws.ungroupedTabs || [])
       if (!isWorkspaceNewTab(t) && match(`${t.title} ${t.url}`, q))
-        rows.push(tabRow(t, `${ws.name} / 未分组`, true));
+        addTab(t, `${ws.name} / 未分组`, true);
   }
   return rows
-    .map((button, index) => ({ button, index }))
+    .map((result, index) => ({ result, index }))
     .sort(
       (a, b) =>
-        resultScore(b.button, q) - resultScore(a.button, q) ||
+        resultScore(b.result, q) - resultScore(a.result, q) ||
         a.index - b.index,
     )
-    .map(({ button }) => button)
-    .slice(0, 100);
+    .map(({ result }) => result)
+    .slice(0, 100)
+    .map((result) =>
+      result.kind === "tab"
+        ? tabRow(result.tab, result.prefix, result.snapshot)
+        : section(result.title, result.meta, result.onClick, result.color),
+    );
 }
 function section(title, meta, onClick, color) {
   return row(title, meta, onClick, color);
@@ -221,7 +347,13 @@ function row(title, meta, onClick, color, icon) {
   return b;
 }
 function resultScore(button, q) {
-  const text = button.textContent.toLowerCase();
+  const title =
+    button.kind === "tab" ? button.tab?.title || button.tab?.url : button.title;
+  const meta =
+    button.kind === "tab"
+      ? `${button.prefix || ""} ${button.tab?.url || ""}`
+      : button.meta;
+  const text = `${title || ""} ${meta || ""}`.toLowerCase();
   if (text.startsWith(q)) return 3;
   if (text.includes(` ${q}`)) return 2;
   return 1;
@@ -265,7 +397,10 @@ function match(value, q) {
     .includes(q);
 }
 function safeIcon(url) {
-  return /^(https?:|data:image\/)/.test(String(url || "")) ? url : "";
+  const value = String(url || "");
+  return value.length <= MAX_ICON_URL_LENGTH && /^(https?:|data:image\/)/.test(value)
+    ? value
+    : "";
 }
 function html(value) {
   return String(value ?? "").replace(
@@ -351,6 +486,18 @@ async function restoreGroup(ws, group) {
     type: "RESTORE_SAVED_GROUP",
     workspaceId: ws.id,
     groupIndex: index,
+    sourceGroupId: group.sourceGroupId,
+    target,
+  });
+  await closePanel(panelWindowId);
+}
+async function restoreUngrouped(ws) {
+  const target = chooseRestoreTarget();
+  if (!target) return;
+  const panelWindowId = await getPanelWindowId();
+  await send({
+    type: "RESTORE_SAVED_UNGROUPED",
+    workspaceId: ws.id,
     target,
   });
   await closePanel(panelWindowId);

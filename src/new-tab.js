@@ -20,6 +20,7 @@ const snapshotSection = $("#snapshotSection");
 const snapshotMeta = $("#snapshotMeta");
 const snapshotGrid = $("#snapshotGrid");
 const WINDOW_ORDER_KEY = "windowOrder";
+const MAX_ICON_URL_LENGTH = 2048;
 const COLORS = {
   grey: "#7a8694",
   blue: "#2f6fed",
@@ -37,7 +38,8 @@ let selectedIndex = 0;
 let resizeTimer = null;
 let selectedWindowId = null;
 let switchRequestId = 0;
-let switchWindowChain = Promise.resolve();
+let switchWindowTask = null;
+let pendingWindowSwitch = null;
 let pendingFocusWindowId = null;
 let pointerInteractionActive = false;
 let pendingRuntimeState = null;
@@ -189,6 +191,7 @@ async function resync() {
   }
 }
 function render() {
+  pruneExpandedGroups(state.windows);
   const s = state.summary || {};
   summary.textContent = s.syncedAt
     ? `已同步 ${formatTime(s.syncedAt)}`
@@ -243,6 +246,7 @@ function renderRecent(items) {
   );
 }
 function renderCurrent(windows) {
+  pruneExpandedGroups(windows);
   windowGrid.replaceChildren();
   currentGrid.replaceChildren();
   const list = (windows || []).filter((w) => tabCount(w));
@@ -306,6 +310,19 @@ function renderCurrent(windows) {
     columns[index % columnCount].append(renderGroup(group));
   });
   currentGrid.append(...columns);
+}
+
+function pruneExpandedGroups(windows) {
+  const keys = new Set(
+    (windows || []).flatMap((windowState) =>
+      (windowState.groups || []).map(
+        (group) => `${windowState.id}:${group.id}`,
+      ),
+    ),
+  );
+  for (const key of expandedGroups) {
+    if (!keys.has(key)) expandedGroups.delete(key);
+  }
 }
 function renderWindowCard(windowState, title, selected) {
   const card = document.createElement("article");
@@ -825,7 +842,10 @@ function formatTime(timestamp) {
     : "未同步";
 }
 function safeIconUrl(url) {
-  return /^(https?:|data:image\/)/.test(String(url || "")) ? url : "";
+  const value = String(url || "");
+  return value.length <= MAX_ICON_URL_LENGTH && /^(https?:|data:image\/)/.test(value)
+    ? value
+    : "";
 }
 function escapeHtml(value) {
   return String(value ?? "").replace(
@@ -867,22 +887,40 @@ async function switchWindow(windowId) {
   pendingFocusWindowId = windowId;
   selectedWindowId = windowId;
   renderCurrent(state.windows);
-  const switchRequest = async () => {
-    if (requestId !== switchRequestId) return;
+  pendingWindowSwitch = { requestId, windowId, previousWindowId };
+  if (switchWindowTask) return switchWindowTask;
+  const task = drainWindowSwitches();
+  switchWindowTask = task;
+  task.then(
+    () => {
+      if (switchWindowTask === task) switchWindowTask = null;
+    },
+    () => {
+      if (switchWindowTask === task) switchWindowTask = null;
+    },
+  );
+  return task;
+}
+
+async function drainWindowSwitches() {
+  let currentError = null;
+  while (pendingWindowSwitch) {
+    const request = pendingWindowSwitch;
+    pendingWindowSwitch = null;
+    if (request.requestId !== switchRequestId) continue;
     try {
-      await sendMessage({ type: "FOCUS_WINDOW", windowId });
-      if (requestId === switchRequestId) pendingFocusWindowId = null;
+      await sendMessage({ type: "FOCUS_WINDOW", windowId: request.windowId });
+      if (request.requestId === switchRequestId) pendingFocusWindowId = null;
     } catch (error) {
-      if (requestId === switchRequestId) {
+      if (request.requestId === switchRequestId) {
         pendingFocusWindowId = null;
-        selectedWindowId = previousWindowId;
+        selectedWindowId = request.previousWindowId;
         renderCurrent(state.windows);
+        currentError = error;
       }
-      throw error;
     }
-  };
-  switchWindowChain = switchWindowChain.then(switchRequest, switchRequest);
-  return switchWindowChain;
+  }
+  if (currentError) throw currentError;
 }
 async function persistWindowOrder(order = getWindowOrderFromDom()) {
   if (!order.length) return;
@@ -986,6 +1024,7 @@ async function restoreGroup(workspace, group) {
     type: "RESTORE_SAVED_GROUP",
     workspaceId: workspace.id,
     groupIndex: index,
+    sourceGroupId: group.sourceGroupId,
     target,
   });
 }
